@@ -85,8 +85,8 @@ def get_cache_miss_topk_kernel(
         tl.store(debug_ptr + 3 * topk + cols, avail_rank, mask=mask)
         tl.store(debug_ptr + 4 * topk + cols, miss_vals, mask=mask)
 
-    # print("find success")
-
+    # 将 new 中未在 old 中出现的token（缓存未命中项），填充到 old 中可用的槽位
+    # （包括旧token被替换的槽位和原本为空的槽位）。
     # Gather-then-scatter: split by SUB_BLOCK chunks of target rank
     # Phase 1 (gather): for each target rank r in [sb_start, sb_start+SUB_BLOCK),
     #            find miss_vals where miss_rank == r
@@ -101,7 +101,9 @@ def get_cache_miss_topk_kernel(
         tr_b = tl.broadcast_to(target_ranks[None, :], (BLOCK, SUB_BLOCK))
         mv_b = tl.broadcast_to(miss_vals[:, None], (BLOCK, SUB_BLOCK))
         mm_b = tl.broadcast_to(miss_mask[:, None], (BLOCK, SUB_BLOCK))
-
+# - miss_match[0][0] = True → 位置0的未命中项，排名正好是0
+# - miss_match[1][1] = True → 位置1的未命中项，排名正好是1
+# rank 表示当前关注的排名，sb_start 表示当前 sub-block 的起始索引
         miss_match = (mr_b == tr_b) & mm_b
         gathered = tl.sum(
             tl.where(miss_match, mv_b, tl.zeros((BLOCK, SUB_BLOCK), tl.int32)),
@@ -109,20 +111,39 @@ def get_cache_miss_topk_kernel(
         )
 
         # Phase 2: scatter - [BLOCK, SUB_BLOCK]
+        # 广播可用槽位排名到[BLOCK, SUB_BLOCK]矩阵
+        # 物理意义：将每个位置的可用槽位排名扩展到当前处理的所有目标排名
         ar_b = tl.broadcast_to(avail_rank[:, None], (BLOCK, SUB_BLOCK))
+        
+        # 广播可用槽位掩码到[BLOCK, SUB_BLOCK]矩阵
+        # 物理意义：将每个位置是否为可用槽位的信息扩展到当前处理的所有目标排名
         am_b = tl.broadcast_to(avail_mask[:, None], (BLOCK, SUB_BLOCK))
+        
+        # 检查目标排名是否有效（小于未命中项总数）
+        # 物理意义：确保只处理实际存在的未命中项排名
         valid_rank = tr_b < num_miss
 
+        # 计算槽位匹配矩阵：当前位置的可用槽位排名是否等于目标排名，且是可用槽位，且排名有效
+        # 物理意义："这个可用槽位是否应该放置当前目标排名的未命中项？"
         slot_match = (ar_b == tr_b) & am_b & valid_rank
+        
+        # 根据槽位匹配矩阵，将收集到的未命中项值分散到对应位置
+        # 物理意义：将当前处理的目标排名对应的未命中项值，放置到对应的可用槽位
         result = tl.sum(
             tl.where(
                 slot_match,
-                gathered[None, :],
-                tl.zeros((BLOCK, SUB_BLOCK), tl.int32),
+                gathered[None, :],  # 将收集到的值广播到所有位置
+                tl.zeros((BLOCK, SUB_BLOCK), tl.int32),  # 不匹配的位置用0填充
             ),
-            axis=1,
+            axis=1,  # 按行求和，得到每个位置最终的值
         )
+        
+        # 检查哪些位置有匹配的槽位
+        # 物理意义：找出哪些位置需要被更新为新的未命中项值
         has_match = tl.sum(slot_match.to(tl.int32), axis=1) > 0
+        
+        # 更新输出数组：有匹配的位置用新值，否则保持原值
+        # 物理意义：将找到位置的未命中项值填充到输出数组中
         out = tl.where(has_match, result, out)
 
     # ---- remove req offset and store ----

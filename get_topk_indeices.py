@@ -33,8 +33,7 @@ def mark_cache_tokens_kernel(
     old_with_offset = tl.load(old_ptr + row_off + cols, mask=mask, other=-1).to(tl.int64)
     old_token = old_with_offset - req_offset
     old_valid = mask & (old_with_offset >= 0) & (old_token >= 0) & (old_token < TOKEN_LIMIT)
-    stamp_i32 = stamp.to(tl.int32)
-    stamp_vals = tl.full((BLOCK,), 0, tl.int32) + stamp_i32
+    stamp_vals = tl.full((BLOCK,), 0, tl.int32) + stamp
     tl.store(old_marker_ptr + marker_off + old_token, stamp_vals, mask=old_valid)
 
     new_token = tl.load(new_ptr + row_off + cols, mask=mask, other=-1).to(tl.int64)
@@ -81,9 +80,8 @@ def compact_cache_miss_slots_kernel(
     old_hit = tl.load(old_marker_ptr + marker_off + new_token, mask=new_valid, other=0)
     new_hit = tl.load(new_marker_ptr + marker_off + old_token, mask=old_valid, other=0)
 
-    stamp_i32 = stamp.to(tl.int32)
-    miss_mask = new_valid & (old_hit != stamp_i32)
-    avail_mask = old_valid & (new_hit != stamp_i32)
+    miss_mask = new_valid & (old_hit != stamp)
+    avail_mask = old_valid & (new_hit != stamp)
 
     num_miss = tl.sum(miss_mask.to(tl.int32), axis=0)
     num_avail = tl.sum(avail_mask.to(tl.int32), axis=0)

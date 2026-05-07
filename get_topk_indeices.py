@@ -1,3 +1,5 @@
+import time
+
 import torch
 import torch_npu
 
@@ -21,21 +23,21 @@ def mark_cache_tokens_kernel(
     if pid >= num_reqs:
         return
 
-    req_id = tl.load(req_ids_ptr + pid).to(tl.int32)
+    req_id = tl.load(req_ids_ptr + pid).to(tl.int64)
     req_offset = req_id * TOKEN_LIMIT
     row_off = pid * topk
     marker_off = pid * TOKEN_LIMIT
     cols = tl.arange(0, BLOCK)
     mask = cols < topk
 
-    old_with_offset = tl.load(old_ptr + row_off + cols, mask=mask, other=-1).to(tl.int32)
+    old_with_offset = tl.load(old_ptr + row_off + cols, mask=mask, other=-1).to(tl.int64)
     old_token = old_with_offset - req_offset
     old_valid = mask & (old_with_offset >= 0) & (old_token >= 0) & (old_token < TOKEN_LIMIT)
     stamp_i32 = stamp.to(tl.int32)
     stamp_vals = tl.full((BLOCK,), 0, tl.int32) + stamp_i32
     tl.store(old_marker_ptr + marker_off + old_token, stamp_vals, mask=old_valid)
 
-    new_token = tl.load(new_ptr + row_off + cols, mask=mask, other=-1).to(tl.int32)
+    new_token = tl.load(new_ptr + row_off + cols, mask=mask, other=-1).to(tl.int64)
     new_valid = mask & (new_token >= 0) & (new_token < TOKEN_LIMIT)
     tl.store(new_marker_ptr + marker_off + new_token, stamp_vals, mask=new_valid)
 
@@ -61,18 +63,18 @@ def compact_cache_miss_slots_kernel(
     if pid >= num_reqs:
         return
 
-    req_id = tl.load(req_ids_ptr + pid).to(tl.int32)
+    req_id = tl.load(req_ids_ptr + pid).to(tl.int64)
     req_offset = req_id * TOKEN_LIMIT
     row_off = pid * topk
     marker_off = pid * TOKEN_LIMIT
     cols = tl.arange(0, BLOCK)
     mask = cols < topk
 
-    old_with_offset = tl.load(old_ptr + row_off + cols, mask=mask, other=-1).to(tl.int32)
+    old_with_offset = tl.load(old_ptr + row_off + cols, mask=mask, other=-1).to(tl.int64)
     old_token = old_with_offset - req_offset
     old_valid = mask & (old_with_offset >= 0) & (old_token >= 0) & (old_token < TOKEN_LIMIT)
 
-    new_token = tl.load(new_ptr + row_off + cols, mask=mask, other=-1).to(tl.int32)
+    new_token = tl.load(new_ptr + row_off + cols, mask=mask, other=-1).to(tl.int64)
     new_valid = mask & (new_token >= 0) & (new_token < TOKEN_LIMIT)
     new_with_offset = new_token + req_offset
 
@@ -120,7 +122,7 @@ def apply_cache_miss_slots_kernel(
     if pid >= num_reqs:
         return
 
-    req_id = tl.load(req_ids_ptr + pid).to(tl.int32)
+    req_id = tl.load(req_ids_ptr + pid).to(tl.int64)
     req_offset = req_id * TOKEN_LIMIT
     row_off = pid * topk
     cols = tl.arange(0, BLOCK)
@@ -133,11 +135,11 @@ def apply_cache_miss_slots_kernel(
     update_mask = cols < num_slots
     miss_mask = cols < num_miss
     slots = tl.load(slot_scratch_ptr + row_off + cols, mask=update_mask, other=0).to(tl.int32)
-    miss_with_offset = tl.load(miss_scratch_ptr + row_off + cols, mask=miss_mask, other=-1).to(tl.int32)
+    miss_with_offset = tl.load(miss_scratch_ptr + row_off + cols, mask=miss_mask, other=-1).to(tl.int64)
     miss_token = miss_with_offset - req_offset
 
     tl.store(old_ptr + row_off + slots, miss_with_offset, mask=update_mask)
-    tl.store(out_ptr + row_off + slots, miss_token, mask=miss_mask)
+    tl.store(out_ptr + row_off + slots, miss_token.to(tl.int32), mask=miss_mask)
 
 
 @triton.jit
@@ -288,7 +290,7 @@ def get_cache_miss_topk_indices_triton_bitmap(
     if slot_scratch is None:
         slot_scratch = torch.empty_like(topk_indices_new, dtype=torch.int32)
     if miss_scratch is None:
-        miss_scratch = torch.empty_like(topk_indices_new, dtype=torch.int32)
+        miss_scratch = torch.empty_like(topk_indices_old)
     if miss_count is None:
         miss_count = torch.empty((num_reqs,), dtype=torch.int32, device=topk_indices_new.device)
     if slot_count is None:
@@ -384,124 +386,204 @@ def get_cache_miss_topk_indices_triton(
     )
 
 
-def prepare_cache_miss_scratch(owner, num_reqs: int, topk: int, device, token_limit: int = 65536):
+def prepare_cache_miss_scratch(
+    num_reqs: int,
+    topk: int,
+    device,
+    token_limit: int = 65536,
+    history_dtype: torch.dtype = torch.int64,
+):
+    cache = prepare_cache_miss_scratch
     marker_shape = (num_reqs, token_limit)
     scratch_shape = (num_reqs, topk)
     needs_alloc = (
-        getattr(owner, "_cache_miss_token_limit", None) != token_limit
-        or getattr(owner, "_cache_miss_device", None) != device
-        or getattr(owner, "_cache_miss_marker_shape", (0, 0))[0] < num_reqs
-        or getattr(owner, "_cache_miss_scratch_shape", (0, 0))[0] < num_reqs
-        or getattr(owner, "_cache_miss_scratch_shape", (0, 0))[1] < topk
+        getattr(cache, "_cache_miss_token_limit", None) != token_limit
+        or getattr(cache, "_cache_miss_device", None) != device
+        or getattr(cache, "_cache_miss_history_dtype", None) != history_dtype
+        or getattr(cache, "_cache_miss_marker_shape", (0, 0))[0] < num_reqs
+        or getattr(cache, "_cache_miss_scratch_shape", (0, 0))[0] < num_reqs
+        or getattr(cache, "_cache_miss_scratch_shape", (0, 0))[1] < topk
     )
 
     if needs_alloc:
-        owner._cache_miss_old_marker = torch.zeros(marker_shape, dtype=torch.int32, device=device)
-        owner._cache_miss_new_marker = torch.zeros(marker_shape, dtype=torch.int32, device=device)
-        owner._cache_miss_slot_scratch = torch.empty(scratch_shape, dtype=torch.int32, device=device)
-        owner._cache_miss_miss_scratch = torch.empty(scratch_shape, dtype=torch.int32, device=device)
-        owner._cache_miss_miss_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
-        owner._cache_miss_slot_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
-        owner._cache_miss_token_limit = token_limit
-        owner._cache_miss_device = device
-        owner._cache_miss_marker_shape = marker_shape
-        owner._cache_miss_scratch_shape = scratch_shape
-        owner._cache_miss_stamp = 0
+        cache._cache_miss_old_marker = torch.zeros(marker_shape, dtype=torch.int32, device=device)
+        cache._cache_miss_new_marker = torch.zeros(marker_shape, dtype=torch.int32, device=device)
+        cache._cache_miss_slot_scratch = torch.empty(scratch_shape, dtype=torch.int32, device=device)
+        cache._cache_miss_miss_scratch = torch.empty(scratch_shape, dtype=history_dtype, device=device)
+        cache._cache_miss_miss_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
+        cache._cache_miss_slot_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
+        cache._cache_miss_token_limit = token_limit
+        cache._cache_miss_device = device
+        cache._cache_miss_history_dtype = history_dtype
+        cache._cache_miss_marker_shape = marker_shape
+        cache._cache_miss_scratch_shape = scratch_shape
+        cache._cache_miss_stamp = 0
 
-    owner._cache_miss_stamp += 1
-    if owner._cache_miss_stamp >= 2_000_000_000:
-        owner._cache_miss_old_marker.zero_()
-        owner._cache_miss_new_marker.zero_()
-        owner._cache_miss_stamp = 1
+    cache._cache_miss_stamp += 1
+    if cache._cache_miss_stamp >= 2_000_000_000:
+        cache._cache_miss_old_marker.zero_()
+        cache._cache_miss_new_marker.zero_()
+        cache._cache_miss_stamp = 1
 
     return {
         "token_limit": token_limit,
-        "stamp": owner._cache_miss_stamp,
-        "old_marker": owner._cache_miss_old_marker[:num_reqs],
-        "new_marker": owner._cache_miss_new_marker[:num_reqs],
-        "slot_scratch": owner._cache_miss_slot_scratch[:num_reqs, :topk],
-        "miss_scratch": owner._cache_miss_miss_scratch[:num_reqs, :topk],
-        "miss_count": owner._cache_miss_miss_count[:num_reqs],
-        "slot_count": owner._cache_miss_slot_count[:num_reqs],
+        "stamp": cache._cache_miss_stamp,
+        "old_marker": cache._cache_miss_old_marker[:num_reqs],
+        "new_marker": cache._cache_miss_new_marker[:num_reqs],
+        "slot_scratch": cache._cache_miss_slot_scratch[:num_reqs, :topk],
+        "miss_scratch": cache._cache_miss_miss_scratch[:num_reqs, :topk],
+        "miss_count": cache._cache_miss_miss_count[:num_reqs],
+        "slot_count": cache._cache_miss_slot_count[:num_reqs],
     }
 
 
-def _get_topk_buffer(
-    self,
-    topk_indices: torch.Tensor,       # [num_tokens, 1, max_seq_len]
-    kv_cache: tuple[torch.Tensor, torch.Tensor],
-    attn_metadata: M,               
-    layer_name: str,
-    block_table: torch.Tensor,        # [num_tokens, max_blocks]
-    seq_len_kv: torch.Tensor,
+def _get_cache_miss_topk_indices_reference_cpu(
+    req_ids_tensor: torch.Tensor,
+    topk_indices_old: torch.Tensor,
+    topk_indices_new: torch.Tensor,
+    token_limit: int = 65536,
 ):
-    forward_context: ForwardContext = get_forward_context()
-    num_reqs = topk_indices.shape[0]
-    topk_buffer_k = kv_cache[3][:num_reqs]
-    topk_buffer_v = kv_cache[4][:num_reqs]
-    topk_indices = topk_indices.squeeze(1) # TODO maybe consider dim1 (head_num?)
+    req_ids_cpu = req_ids_tensor.cpu().to(torch.int64)
+    old_cpu = topk_indices_old.cpu().to(torch.int64)
+    new_cpu = topk_indices_new.cpu().to(torch.int64)
+    out_cpu = torch.full_like(new_cpu, -1, dtype=torch.int32)
+    updated_old_cpu = old_cpu.clone()
 
-    # cache reuse
-    # num_tokens_ori = (topk_indices >= 0).sum().item()
-    # topk_indices = self.get_cache_miss_topk_indices(
-    #     attn_metadata.req_ids_tensor[:num_reqs],
-    #     self.last_step_topk_indices[:num_reqs],
-    #     topk_indices,
-    # )
+    num_reqs, topk = new_cpu.shape
+    for req_idx in range(num_reqs):
+        req_offset = int(req_ids_cpu[req_idx].item()) * token_limit
+        old_row = old_cpu[req_idx].tolist()
+        new_row = new_cpu[req_idx].tolist()
+        new_with_offset = [
+            token + req_offset if token >= 0 else -1
+            for token in new_row
+        ]
 
-    t1 = time.time()
-    cache_miss_scratch = prepare_cache_miss_scratch(
-        self,
-        num_reqs,
-        topk_indices.shape[1],
-        topk_indices.device,
+        old_set = {token for token in old_row if token >= 0}
+        new_set = {token for token in new_with_offset if token >= 0}
+        miss_vals = [
+            token for token in new_with_offset
+            if token >= 0 and token not in old_set
+        ]
+
+        avail_mask = [
+            token >= 0 and token not in new_set
+            for token in old_row
+        ]
+        num_shortage = len(miss_vals) - sum(avail_mask)
+        if num_shortage > 0:
+            selected_empty = 0
+            for i, token in enumerate(old_row):
+                if token == -1:
+                    selected_empty += 1
+                    if selected_empty <= num_shortage:
+                        avail_mask[i] = True
+
+        avail_slots = [i for i, is_avail in enumerate(avail_mask) if is_avail]
+        for rank, slot in enumerate(avail_slots):
+            if rank < len(miss_vals):
+                updated_old_cpu[req_idx, slot] = miss_vals[rank]
+                out_cpu[req_idx, slot] = miss_vals[rank] - req_offset
+            else:
+                updated_old_cpu[req_idx, slot] = -1
+
+        assert len(avail_slots) >= len(miss_vals), (
+            f"not enough available slots for req {req_idx}: "
+            f"{len(avail_slots)} slots, {len(miss_vals)} misses, topk={topk}"
+        )
+
+    return out_cpu, updated_old_cpu.to(topk_indices_old.cpu().dtype)
+
+
+def test_get_cache_miss_topk_indices_triton_topk2048(
+    num_reqs: int = 2,
+    token_limit: int = 65536,
+    empty_ratio: float = 0.2,
+    invalid_ratio: float = 0.1,
+    repeat: int = 20,
+    seed: int = 0,
+    device: str = "npu",
+):
+    topk = 2048
+    torch.manual_seed(seed)
+
+    req_ids_cpu = torch.arange(num_reqs, dtype=torch.int32)
+    old_cpu = torch.empty((num_reqs, topk), dtype=torch.int32)
+    new_cpu = torch.empty((num_reqs, topk), dtype=torch.int32)
+    for req_idx in range(num_reqs):
+        old_cpu[req_idx] = torch.randperm(token_limit, dtype=torch.int32)[:topk]
+        new_cpu[req_idx] = torch.randperm(token_limit, dtype=torch.int32)[:topk]
+        old_cpu[req_idx][torch.rand(topk) < empty_ratio] = -1
+        new_cpu[req_idx][torch.rand(topk) < invalid_ratio] = -1
+
+    req_offsets_cpu = (req_ids_cpu.to(torch.int64) * token_limit).unsqueeze(1)
+    old_with_offset_cpu = torch.where(
+        old_cpu.to(torch.int64) >= 0,
+        old_cpu.to(torch.int64) + req_offsets_cpu,
+        torch.full_like(old_cpu.to(torch.int64), -1),
     )
-    topk_indices = get_cache_miss_topk_indices_triton(
-        attn_metadata.req_ids_tensor[:num_reqs],
-        self.last_step_topk_indices[:num_reqs],
-        topk_indices,
+
+    gold_out_cpu, gold_old_cpu = _get_cache_miss_topk_indices_reference_cpu(
+        req_ids_cpu,
+        old_with_offset_cpu,
+        new_cpu,
+        token_limit=token_limit,
+    )
+
+    req_ids = req_ids_cpu.to(device)
+    old_with_offset = old_with_offset_cpu.to(device)
+    new_indices = new_cpu.to(device)
+    cache_miss_scratch = prepare_cache_miss_scratch(
+        num_reqs,
+        topk,
+        new_indices.device,
+        token_limit=token_limit,
+        history_dtype=old_with_offset.dtype,
+    )
+
+    ret = get_cache_miss_topk_indices_triton(
+        req_ids,
+        old_with_offset,
+        new_indices,
         **cache_miss_scratch,
     )
-    t2 = time.time()
-    print(f">>>>>>>>>>> get_cache_miss_topk_indices_triton {(t2-t1)*1000:.2f}ms")
-    num_tokens_cache_miss = (topk_indices >= 0).sum().item()
+    torch.npu.synchronize()
 
-    # common
-    t1 = time.time()
-    valid_mask = topk_indices >= 0
-    num_offloaded_blocks = attn_metadata.num_offloaded_blocks[:num_reqs].unsqueeze(1)
-    offload_thresholds = num_offloaded_blocks * self.block_size
-    npu_mask = (topk_indices >= offload_thresholds) & valid_mask
-    cpu_mask = (topk_indices < offload_thresholds) & valid_mask
-    t2 = time.time()
-    print(f">>>>>>>>>>> time 2 {(t2-t1)*1000:.2f}ms")
+    ret_cpu = ret.cpu()
+    updated_old_cpu = old_with_offset.cpu()
+    out_ok = torch.equal(ret_cpu, gold_out_cpu)
+    old_ok = torch.equal(updated_old_cpu, gold_old_cpu)
+    print(f"correctness: out={out_ok}, updated_old={old_ok}")
+    if not out_ok:
+        diff = (ret_cpu != gold_out_cpu).nonzero()
+        print("first out diff:", diff[:10])
+    if not old_ok:
+        diff = (updated_old_cpu != gold_old_cpu).nonzero()
+        print("first old diff:", diff[:10])
 
-    # num_tokens_npu = npu_mask.sum().item()
-    # num_tokens_cpu = cpu_mask.sum().item()
+    old_base = old_with_offset_cpu.to(device)
+    old_work = torch.empty_like(old_base)
+    torch.npu.synchronize()
+    elapsed_ms = 0.0
+    for _ in range(repeat):
+        old_work.copy_(old_base)
+        cache_miss_scratch = prepare_cache_miss_scratch(
+            num_reqs,
+            topk,
+            new_indices.device,
+            token_limit=token_limit,
+            history_dtype=old_work.dtype,
+        )
+        torch.npu.synchronize()
+        t1 = time.perf_counter()
+        _ = get_cache_miss_topk_indices_triton(
+            req_ids,
+            old_work,
+            new_indices,
+            **cache_miss_scratch,
+        )
+        torch.npu.synchronize()
+        elapsed_ms += (time.perf_counter() - t1) * 1000
 
-    # load npu
-    t1 = time.time()
-    block_indices = torch.clamp(topk_indices // self.block_size, min=0)
-    block_ids = torch.gather(block_table, 1, block_indices)
-    offsets_in_block = topk_indices % self.block_size
-    npu_mask = npu_mask.unsqueeze(-1).unsqueeze(-1)
-    topk_buffer_k[...] = torch.where(npu_mask, kv_cache[0][block_ids, offsets_in_block], topk_buffer_k)
-    topk_buffer_v[...] = torch.where(npu_mask, kv_cache[1][block_ids, offsets_in_block], topk_buffer_v)
-    t2 = time.time()
-    print(f">>>>>>>>>>> time 3 {(t2-t1)*1000:.2f}ms")
-    # load cpu
-    cpu_token_indices = torch.where(cpu_mask, topk_indices, -1)
-    # maybe_load_kv_token_wise_graph(layer_name, num_reqs, cpu_token_indices, cpu_mask, forward_context.capturing)
-
-    # generate new block_table & indices
-    t1 = time.time()
-    topk_buffer_k = topk_buffer_k.reshape([-1, self.block_size, 1, 512])
-    topk_buffer_v = topk_buffer_v.reshape([-1, self.block_size, 1, 64])
-    sparse_block_table = self.sparse_block_table[:num_reqs]
-    sparse_seq_len_kv = torch.clamp(seq_len_kv, max=2048)
-    sparse_topk_indices = self.sparse_topk_indices[:num_reqs]
-    sparse_topk_indices = torch.where(sparse_topk_indices < sparse_seq_len_kv.unsqueeze(1), sparse_topk_indices, -1)
-    sparse_topk_indices = sparse_topk_indices.unsqueeze(1)
-    t2 = time.time()
-    print(f">>>>>>>>>>> time 4 {(t2-t1)*1000:.2f}ms")
-    return (topk_buffer_k, topk_buffer_v), sparse_topk_indices, sparse_block_table, sparse_seq_len_kv
+    print(f"topk={topk}, num_reqs={num_reqs}, avg={elapsed_ms / repeat:.3f} ms")
+    return out_ok and old_ok

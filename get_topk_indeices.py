@@ -14,7 +14,7 @@ def mark_cache_tokens_kernel(
         old_marker_ptr,
         new_marker_ptr,
         num_reqs,
-        stamp,
+        stamp_ptr,
         topk: tl.constexpr,
         TOKEN_LIMIT: tl.constexpr,
         BLOCK: tl.constexpr,
@@ -33,6 +33,7 @@ def mark_cache_tokens_kernel(
     old_with_offset = tl.load(old_ptr + row_off + cols, mask=mask, other=-1).to(tl.int64)
     old_token = old_with_offset - req_offset
     old_valid = mask & (old_with_offset >= 0) & (old_token >= 0) & (old_token < TOKEN_LIMIT)
+    stamp = tl.load(stamp_ptr).to(tl.int32)
     stamp_vals = tl.full((BLOCK,), 0, tl.int32) + stamp
     tl.store(old_marker_ptr + marker_off + old_token, stamp_vals, mask=old_valid)
 
@@ -53,7 +54,7 @@ def compact_cache_miss_slots_kernel(
         miss_count_ptr,
         slot_count_ptr,
         num_reqs,
-        stamp,
+        stamp_ptr,
         topk: tl.constexpr,
         TOKEN_LIMIT: tl.constexpr,
         BLOCK: tl.constexpr,
@@ -80,6 +81,7 @@ def compact_cache_miss_slots_kernel(
     old_hit = tl.load(old_marker_ptr + marker_off + new_token, mask=new_valid, other=0)
     new_hit = tl.load(new_marker_ptr + marker_off + old_token, mask=old_valid, other=0)
 
+    stamp = tl.load(stamp_ptr).to(tl.int32)
     miss_mask = new_valid & (old_hit != stamp)
     avail_mask = old_valid & (new_hit != stamp)
 
@@ -267,7 +269,7 @@ def get_cache_miss_topk_indices_triton_bitmap(
     miss_scratch: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
     slot_count: torch.Tensor | None = None,
-    stamp: int = 1,
+    stamp_tensor: torch.Tensor | None = None,
 ):
     num_reqs, topk = topk_indices_new.shape
     assert topk == topk_indices_old.shape[1]
@@ -293,6 +295,8 @@ def get_cache_miss_topk_indices_triton_bitmap(
         miss_count = torch.empty((num_reqs,), dtype=torch.int32, device=topk_indices_new.device)
     if slot_count is None:
         slot_count = torch.empty((num_reqs,), dtype=torch.int32, device=topk_indices_new.device)
+    if stamp_tensor is None:
+        stamp_tensor = torch.ones((1,), dtype=torch.int32, device=topk_indices_new.device)
 
     grid = (num_reqs,)
     BLOCK = triton.next_power_of_2(topk)
@@ -304,7 +308,7 @@ def get_cache_miss_topk_indices_triton_bitmap(
         old_marker,
         new_marker,
         num_reqs,
-        stamp,
+        stamp_tensor,
         topk=topk,
         TOKEN_LIMIT=token_limit,
         BLOCK=BLOCK,
@@ -321,7 +325,7 @@ def get_cache_miss_topk_indices_triton_bitmap(
         miss_count,
         slot_count,
         num_reqs,
-        stamp,
+        stamp_tensor,
         topk=topk,
         TOKEN_LIMIT=token_limit,
         BLOCK=BLOCK,
@@ -410,6 +414,7 @@ def prepare_cache_miss_scratch(
         cache._cache_miss_miss_scratch = torch.empty(scratch_shape, dtype=history_dtype, device=device)
         cache._cache_miss_miss_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
         cache._cache_miss_slot_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
+        cache._cache_miss_stamp_tensor = torch.empty((1,), dtype=torch.int32, device=device)
         cache._cache_miss_token_limit = token_limit
         cache._cache_miss_device = device
         cache._cache_miss_history_dtype = history_dtype
@@ -422,10 +427,11 @@ def prepare_cache_miss_scratch(
         cache._cache_miss_old_marker.zero_()
         cache._cache_miss_new_marker.zero_()
         cache._cache_miss_stamp = 1
+    cache._cache_miss_stamp_tensor.fill_(cache._cache_miss_stamp)
 
     return {
         "token_limit": token_limit,
-        "stamp": cache._cache_miss_stamp,
+        "stamp_tensor": cache._cache_miss_stamp_tensor,
         "old_marker": cache._cache_miss_old_marker[:num_reqs],
         "new_marker": cache._cache_miss_new_marker[:num_reqs],
         "slot_scratch": cache._cache_miss_slot_scratch[:num_reqs, :topk],

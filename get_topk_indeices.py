@@ -1,7 +1,7 @@
+import argparse
 import time
 
 import torch
-import torch_npu
 
 import triton
 import triton.language as tl
@@ -388,6 +388,75 @@ def get_cache_miss_topk_indices_triton(
     )
 
 
+class CacheMissTopKScratch:
+    def __init__(self, token_limit: int = 65536):
+        self.token_limit = token_limit
+        self.device = None
+        self.history_dtype = None
+        self.marker_shape = (0, 0)
+        self.scratch_shape = (0, 0)
+        self.stamp = 0
+        self.old_marker = None
+        self.new_marker = None
+        self.slot_scratch = None
+        self.miss_scratch = None
+        self.miss_count = None
+        self.slot_count = None
+        self.stamp_tensor = None
+
+    def prepare(
+        self,
+        num_reqs: int,
+        topk: int,
+        device,
+        history_dtype: torch.dtype = torch.int64,
+    ):
+        marker_shape = (num_reqs, self.token_limit)
+        scratch_shape = (num_reqs, topk)
+        needs_alloc = (
+            self.device != device
+            or self.history_dtype != history_dtype
+            or self.marker_shape[0] < num_reqs
+            or self.scratch_shape[0] < num_reqs
+            or self.scratch_shape[1] < topk
+        )
+
+        if needs_alloc:
+            self.old_marker = torch.zeros(marker_shape, dtype=torch.int32, device=device)
+            self.new_marker = torch.zeros(marker_shape, dtype=torch.int32, device=device)
+            self.slot_scratch = torch.empty(scratch_shape, dtype=torch.int32, device=device)
+            self.miss_scratch = torch.empty(scratch_shape, dtype=history_dtype, device=device)
+            self.miss_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
+            self.slot_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
+            self.stamp_tensor = torch.empty((1,), dtype=torch.int32, device=device)
+            self.device = device
+            self.history_dtype = history_dtype
+            self.marker_shape = marker_shape
+            self.scratch_shape = scratch_shape
+            self.stamp = 0
+
+        self.stamp += 1
+        if self.stamp >= 2_000_000_000:
+            self.old_marker.zero_()
+            self.new_marker.zero_()
+            self.stamp = 1
+        self.stamp_tensor.fill_(self.stamp)
+
+        return {
+            "token_limit": self.token_limit,
+            "stamp_tensor": self.stamp_tensor,
+            "old_marker": self.old_marker[:num_reqs],
+            "new_marker": self.new_marker[:num_reqs],
+            "slot_scratch": self.slot_scratch[:num_reqs, :topk],
+            "miss_scratch": self.miss_scratch[:num_reqs, :topk],
+            "miss_count": self.miss_count[:num_reqs],
+            "slot_count": self.slot_count[:num_reqs],
+        }
+
+
+_default_cache_miss_scratch = CacheMissTopKScratch()
+
+
 def prepare_cache_miss_scratch(
     num_reqs: int,
     topk: int,
@@ -395,50 +464,15 @@ def prepare_cache_miss_scratch(
     token_limit: int = 65536,
     history_dtype: torch.dtype = torch.int64,
 ):
-    cache = prepare_cache_miss_scratch
-    marker_shape = (num_reqs, token_limit)
-    scratch_shape = (num_reqs, topk)
-    needs_alloc = (
-        getattr(cache, "_cache_miss_token_limit", None) != token_limit
-        or getattr(cache, "_cache_miss_device", None) != device
-        or getattr(cache, "_cache_miss_history_dtype", None) != history_dtype
-        or getattr(cache, "_cache_miss_marker_shape", (0, 0))[0] < num_reqs
-        or getattr(cache, "_cache_miss_scratch_shape", (0, 0))[0] < num_reqs
-        or getattr(cache, "_cache_miss_scratch_shape", (0, 0))[1] < topk
+    global _default_cache_miss_scratch
+    if _default_cache_miss_scratch.token_limit != token_limit:
+        _default_cache_miss_scratch = CacheMissTopKScratch(token_limit=token_limit)
+    return _default_cache_miss_scratch.prepare(
+        num_reqs,
+        topk,
+        device,
+        history_dtype=history_dtype,
     )
-
-    if needs_alloc:
-        cache._cache_miss_old_marker = torch.zeros(marker_shape, dtype=torch.int32, device=device)
-        cache._cache_miss_new_marker = torch.zeros(marker_shape, dtype=torch.int32, device=device)
-        cache._cache_miss_slot_scratch = torch.empty(scratch_shape, dtype=torch.int32, device=device)
-        cache._cache_miss_miss_scratch = torch.empty(scratch_shape, dtype=history_dtype, device=device)
-        cache._cache_miss_miss_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
-        cache._cache_miss_slot_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
-        cache._cache_miss_stamp_tensor = torch.empty((1,), dtype=torch.int32, device=device)
-        cache._cache_miss_token_limit = token_limit
-        cache._cache_miss_device = device
-        cache._cache_miss_history_dtype = history_dtype
-        cache._cache_miss_marker_shape = marker_shape
-        cache._cache_miss_scratch_shape = scratch_shape
-        cache._cache_miss_stamp = 0
-
-    cache._cache_miss_stamp += 1
-    if cache._cache_miss_stamp >= 2_000_000_000:
-        cache._cache_miss_old_marker.zero_()
-        cache._cache_miss_new_marker.zero_()
-        cache._cache_miss_stamp = 1
-    cache._cache_miss_stamp_tensor.fill_(cache._cache_miss_stamp)
-
-    return {
-        "token_limit": token_limit,
-        "stamp_tensor": cache._cache_miss_stamp_tensor,
-        "old_marker": cache._cache_miss_old_marker[:num_reqs],
-        "new_marker": cache._cache_miss_new_marker[:num_reqs],
-        "slot_scratch": cache._cache_miss_slot_scratch[:num_reqs, :topk],
-        "miss_scratch": cache._cache_miss_miss_scratch[:num_reqs, :topk],
-        "miss_count": cache._cache_miss_miss_count[:num_reqs],
-        "slot_count": cache._cache_miss_slot_count[:num_reqs],
-    }
 
 
 def _get_cache_miss_topk_indices_reference_cpu(
@@ -537,11 +571,11 @@ def test_get_cache_miss_topk_indices_triton_topk2048(
     req_ids = req_ids_cpu.to(device)
     old_with_offset = old_with_offset_cpu.to(device)
     new_indices = new_cpu.to(device)
-    cache_miss_scratch = prepare_cache_miss_scratch(
+    cache_miss_scratch = CacheMissTopKScratch(token_limit=token_limit)
+    scratch_kwargs = cache_miss_scratch.prepare(
         num_reqs,
         topk,
         new_indices.device,
-        token_limit=token_limit,
         history_dtype=old_with_offset.dtype,
     )
 
@@ -549,7 +583,7 @@ def test_get_cache_miss_topk_indices_triton_topk2048(
         req_ids,
         old_with_offset,
         new_indices,
-        **cache_miss_scratch,
+        **scratch_kwargs,
     )
     torch.npu.synchronize()
 
@@ -565,29 +599,55 @@ def test_get_cache_miss_topk_indices_triton_topk2048(
         diff = (updated_old_cpu != gold_old_cpu).nonzero()
         print("first old diff:", diff[:10])
 
-    old_base = old_with_offset_cpu.to(device)
-    old_work = torch.empty_like(old_base)
-    torch.npu.synchronize()
-    elapsed_ms = 0.0
-    for _ in range(repeat):
-        old_work.copy_(old_base)
-        cache_miss_scratch = prepare_cache_miss_scratch(
-            num_reqs,
-            topk,
-            new_indices.device,
-            token_limit=token_limit,
-            history_dtype=old_work.dtype,
-        )
+    if repeat > 0:
+        old_base = old_with_offset_cpu.to(device)
+        old_work = torch.empty_like(old_base)
         torch.npu.synchronize()
-        t1 = time.perf_counter()
-        _ = get_cache_miss_topk_indices_triton(
-            req_ids,
-            old_work,
-            new_indices,
-            **cache_miss_scratch,
-        )
-        torch.npu.synchronize()
-        elapsed_ms += (time.perf_counter() - t1) * 1000
+        elapsed_ms = 0.0
+        for _ in range(repeat):
+            old_work.copy_(old_base)
+            scratch_kwargs = cache_miss_scratch.prepare(
+                num_reqs,
+                topk,
+                new_indices.device,
+                history_dtype=old_work.dtype,
+            )
+            torch.npu.synchronize()
+            t1 = time.time()
+            _ = get_cache_miss_topk_indices_triton(
+                req_ids,
+                old_work,
+                new_indices,
+                **scratch_kwargs,
+            )
+            torch.npu.synchronize()
+            elapsed_ms += (time.time() - t1) * 1000
 
-    print(f"topk={topk}, num_reqs={num_reqs}, avg={elapsed_ms / repeat:.3f} ms")
+        print(f"topk={topk}, num_reqs={num_reqs}, avg={elapsed_ms / repeat:.3f} ms")
     return out_ok and old_ok
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run topk=2048 cache miss test.")
+    parser.add_argument("--device", default="npu")
+    parser.add_argument("--num-reqs", type=int, default=2)
+    parser.add_argument("--token-limit", type=int, default=65536)
+    parser.add_argument("--empty-ratio", type=float, default=0.2)
+    parser.add_argument("--invalid-ratio", type=float, default=0.1)
+    parser.add_argument("--repeat", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=0)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    ok = test_get_cache_miss_topk_indices_triton_topk2048(
+        num_reqs=args.num_reqs,
+        token_limit=args.token_limit,
+        empty_ratio=args.empty_ratio,
+        invalid_ratio=args.invalid_ratio,
+        repeat=args.repeat,
+        seed=args.seed,
+        device=args.device,
+    )
+    raise SystemExit(0 if ok else 1)
